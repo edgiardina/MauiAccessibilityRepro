@@ -1,20 +1,22 @@
 # MAUI 10.0.70 Accessibility Crash Repro
 
-Minimal reproduction for a crash introduced in **Microsoft.Maui.Controls 10.0.70** affecting Android Release builds when any accessibility service is active.
+Reproduces a crash introduced in **Microsoft.Maui.Controls 10.0.70** on Android Release builds.
 
-## Bug summary
+When an accessibility service (Voice Access, TalkBack, etc.) is active and the user navigates to a page containing a `CollectionView` with `SelectionMode="Single"`, the app crashes with:
 
-`System.MissingMethodException: Method not found: void AndroidX.Core.View.Accessibility.AccessibilityNodeInfoCompat.set_Checked(bool)`
+```
+System.MissingMethodException: Method not found: void AndroidX.Core.View.Accessibility.AccessibilityNodeInfoCompat.set_Checked(bool)
+```
 
-The IL linker strips `AccessibilityNodeInfoCompat.set_Checked` in Release builds because the call site inside MAUI's accessibility delegate is reached only via a JNI callback, which is invisible to static linker analysis. The crash occurs for **any user with an accessibility service active** (Voice Access, TalkBack, password managers, screen readers).
+The accessibility service calls `onInitializeAccessibilityNodeInfo` on each collection item to determine whether it is selected (checked). MAUI's `ControlsAccessibilityDelegate` handles this callback and calls `set_Checked` — but in Release builds the IL linker strips that method because the call site is invisible to static analysis (it is reached only via a JNI callback).
 
 This crash does **not** occur with `Microsoft.Maui.Controls 10.0.51`.
 
 ## Steps to reproduce
 
 1. Clone this repo
-2. Connect an Android device or start an emulator
-3. Enable an accessibility service:
+2. Connect an Android device
+3. Enable Voice Access:
    ```
    adb shell settings put secure enabled_accessibility_services com.google.android.apps.accessibility.voiceaccess/.JustSpeakService
    adb shell settings put secure accessibility_enabled 1
@@ -23,21 +25,16 @@ This crash does **not** occur with `Microsoft.Maui.Controls 10.0.51`.
    ```
    dotnet build -t:Run -f net10.0-android -c Release -p:AndroidAttachDebugger=false
    ```
-5. Launch the app
+5. Tap **"Navigate to CollectionView page"**
 
 ## Expected behavior
 
-App launches without crashing.
+Navigation succeeds; the list of items is displayed.
 
 ## Actual behavior
 
-App crashes immediately with:
+App crashes:
 
-```
-E AndroidRuntime: android.runtime.JavaProxyThrowable: [System.MissingMethodException]: Method not found: void AndroidX.Core.View.Accessibility.AccessibilityNodeInfoCompat.set_Checked(bool)
-```
-
-Full logcat:
 ```
 E AndroidRuntime: FATAL EXCEPTION: main
 E AndroidRuntime: android.runtime.JavaProxyThrowable: [System.MissingMethodException]: Method not found: void AndroidX.Core.View.Accessibility.AccessibilityNodeInfoCompat.set_Checked(bool)
@@ -52,13 +49,12 @@ E AndroidRuntime:   at android.view.AccessibilityInteractionController$Accessibi
 ## Environment
 
 - `Microsoft.Maui.Controls` 10.0.70 (broken), 10.0.51 (working)
-- Target: `net10.0-android`
-- Build configuration: **Release** (Debug builds are not affected — IL linking is disabled)
-- Android API 21+, confirmed on Android 16 (API 36)
+- `net10.0-android`, Release build only (IL linking is disabled in Debug)
+- Confirmed on Android 16 (API 36) and Android emulator API 35
 
-## Root cause analysis
+## Root cause
 
-Verbose build output (`-v:detailed`) shows the build warning:
+A verbose build (`-v:detailed`) shows the following warning in 10.0.70:
 
 ```
 Marshal method 'n_OnInitializeAccessibilityNodeInfo...' for architecture 'X86_64'
@@ -66,14 +62,9 @@ should be declared in type 'Microsoft.Maui.Platform.MauiAccessibilityDelegateCom
 but instead was declared in 'Microsoft.Maui.Controls.Platform.ControlsAccessibilityDelegate'
 ```
 
-MAUI 10.0.70 changed the accessibility delegate hierarchy so that `ControlsAccessibilityDelegate` handles the JNI callback for `OnInitializeAccessibilityNodeInfo`. The call to `AccessibilityNodeInfoCompat.set_Checked` within that override is not reachable via static analysis, so the IL linker strips it from the `Xamarin.AndroidX.Core` assembly.
+10.0.70 changed the accessibility delegate hierarchy so that `ControlsAccessibilityDelegate` owns the JNI callback for `OnInitializeAccessibilityNodeInfo`. The call to `AccessibilityNodeInfoCompat.set_Checked` inside that override is not reachable via static analysis, so the IL linker strips it from `Xamarin.AndroidX.Core`.
 
-None of the standard linker preservation mechanisms resolve this:
-- `AndroidLinkDescription` XML (old Xamarin format — ignored by .NET 10 ILLink)
-- `AndroidLinkSkip` — does not prevent the stripping
-- `TrimmerRootDescriptor` XML with `preserve="nothing"` + explicit method
-- `TrimmerRootDescriptor` XML with `preserve="all"` on the type
-- `[DynamicDependency]` attribute on a guaranteed-live method
+The fix belongs in MAUI: the call site in `ControlsAccessibilityDelegate.OnInitializeAccessibilityNodeInfo` needs a `[DynamicDependency]` or `[Preserve]` annotation. No app-side workaround (TrimmerRootDescriptor, AndroidLinkSkip, DynamicDependency from app code) resolves the crash.
 
 ## Workaround
 
